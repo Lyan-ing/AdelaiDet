@@ -115,7 +115,7 @@ class FCOSOutputs(nn.Module):
         # compute locations to size ranges
         loc_to_size_range = []
         for l, loc_per_level in enumerate(locations):
-            loc_to_size_range_per_level = loc_per_level.new_tensor(self.sizes_of_interest[l])
+            loc_to_size_range_per_level = loc_per_level.new_tensor(self.sizes_of_interest[l])  # 每层负责预测的原图尺寸
             loc_to_size_range.append(
                 loc_to_size_range_per_level[None].expand(num_loc_list[l], -1)
             )
@@ -200,7 +200,7 @@ class FCOSOutputs(nn.Module):
         labels = []
         reg_targets = []
         target_inds = []
-        xs, ys = locations[:, 0], locations[:, 1]
+        xs, ys = locations[:, 0], locations[:, 1]  # x, y axis coord
 
         num_targets = 0
         for im_i in range(len(targets)):
@@ -221,7 +221,7 @@ class FCOSOutputs(nn.Module):
             t = ys[:, None] - bboxes[:, 1][None]
             r = bboxes[:, 2][None] - xs[:, None]
             b = bboxes[:, 3][None] - ys[:, None]
-            reg_targets_per_im = torch.stack([l, t, r, b], dim=2)
+            reg_targets_per_im = torch.stack([l, t, r, b], dim=2)  # 该点到所有真实目标边框的距离
 
             if self.center_sample:
                 if targets_per_im.has("gt_bitmasks_full"):
@@ -334,6 +334,7 @@ class FCOSOutputs(nn.Module):
         labels = instances.labels.flatten()
 
         pos_inds = torch.nonzero(labels != num_classes).squeeze(1)
+        # print(len(pos_inds))
 
         num_pos_local = torch.ones_like(pos_inds).sum()
         num_pos_avg = max(reduce_mean(num_pos_local).item(), 1.0)
@@ -362,7 +363,7 @@ class FCOSOutputs(nn.Module):
             num_samples_avg = max(reduce_mean(num_samples_local).item(), 1.0)
             class_loss = class_loss / num_samples_avg
 
-        losses["loss_fcos_cls"] = class_loss * self.loss_weight_cls
+        losses["loss_fcos_cls"] = class_loss * self.loss_weight_cls[0]
 
         # 2. compute the box regression and quality loss
         instances = instances[pos_inds]
@@ -379,7 +380,7 @@ class FCOSOutputs(nn.Module):
             extras["loss_denorm"] = loss_denorm
 
             reg_loss = self.loc_loss_func(ious, gious, ctrness_targets) / loss_denorm
-            losses["loss_fcos_loc"] = reg_loss
+            losses["loss_fcos_loc"] = reg_loss * self.loss_weight_cls[1]
 
             ctrness_loss = F.binary_cross_entropy_with_logits(
                 instances.ctrness_pred, ctrness_targets,

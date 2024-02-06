@@ -14,12 +14,16 @@ Therefore, we recommend you to use detectron2 as an library and take
 this file as an example of how to use the library.
 You may want to write your own script with your datasets and other customizations.
 """
-
+# import torchvision.datasets
 import logging
 import os
 from collections import OrderedDict
 import torch
 from torch.nn.parallel import DistributedDataParallel
+# if os.path.exists('../configs/BoxInst/MS_R_101_1x.yaml'):
+#     print("True!")
+# else:
+#     print("False")
 
 import detectron2.utils.comm as comm
 from detectron2.data import MetadataCatalog, build_detection_train_loader
@@ -36,8 +40,8 @@ from detectron2.evaluation import (
 )
 from detectron2.modeling import GeneralizedRCNNWithTTA
 from detectron2.utils.logger import setup_logger
-
-from adet.data.dataset_mapper import DatasetMapperWithBasis
+from detectron2.utils.env import TORCH_VERSION
+from adet.data.my_dataset_mapper import DatasetMapperWithBasis
 from adet.data.fcpose_dataset_mapper import FCPoseDatasetMapper
 from adet.config import get_cfg
 from adet.checkpoint import AdetCheckpointer
@@ -49,6 +53,7 @@ class Trainer(DefaultTrainer):
     This is the same Trainer except that we rewrite the
     `build_train_loader`/`resume_or_load` method.
     """
+
     def build_hooks(self):
         """
         Replace `DetectionCheckpointer` with `AdetCheckpointer`.
@@ -59,19 +64,36 @@ class Trainer(DefaultTrainer):
         ret = super().build_hooks()
         for i in range(len(ret)):
             if isinstance(ret[i], hooks.PeriodicCheckpointer):
+                # print("*-*")
                 self.checkpointer = AdetCheckpointer(
                     self.model,
                     self.cfg.OUTPUT_DIR,
                     optimizer=self.optimizer,
                     scheduler=self.scheduler,
                 )
+                # print(ret)
+                # print("***********")
                 ret[i] = hooks.PeriodicCheckpointer(self.checkpointer, self.cfg.SOLVER.CHECKPOINT_PERIOD)
         return ret
-    
+
     def resume_or_load(self, resume=True):
+        # print(self.checkpointer.checkpointables.keys())
+        # print("*******")
         checkpoint = self.checkpointer.resume_or_load(self.cfg.MODEL.WEIGHTS, resume=resume)
+        # print(checkpoint.keys())
+        # print("-------------")
         if resume and self.checkpointer.has_checkpoint():
             self.start_iter = checkpoint.get("iteration", -1) + 1
+        if isinstance(self.model, DistributedDataParallel):
+            # broadcast loaded data/model from the first rank, because other
+            # machines may not have access to the checkpoint file
+            if TORCH_VERSION >= (1, 7):
+                self.model._sync_params_and_buffers()
+                # self.optimizer._sync_params_and_buffers()
+                # self.scheduler._sync_params_and_buffers()
+                # print("******************")
+            self.start_iter = comm.all_gather(self.start_iter)[0]
+            # print(self.start_iter)
 
     def train_loop(self, start_iter: int, max_iter: int):
         """
@@ -89,6 +111,7 @@ class Trainer(DefaultTrainer):
             for self.iter in range(start_iter, max_iter):
                 self.before_step()
                 self.run_step()
+                # print(self.iter)
                 self.after_step()
             self.after_train()
 
@@ -100,6 +123,10 @@ class Trainer(DefaultTrainer):
             OrderedDict of results, if evaluation is enabled. Otherwise None.
         """
         self.train_loop(self.start_iter, self.max_iter)
+        # rank = torch.distributed.get_rank()
+
+        # if rank==0 and hfai.receive_suspend_command():
+        #     self.checkpointer()
         if hasattr(self, "_last_eval_results") and comm.is_main_process():
             verify_results(self.cfg, self._last_eval_results)
             return self._last_eval_results
@@ -183,7 +210,7 @@ def setup(args):
     """
     Create configs and perform basic setups.
     """
-    cfg = get_cfg()
+    cfg = get_cfg()  # Default values are the mean pixel value from ImageNet: [103.53, 116.28, 123.675]
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()
@@ -203,7 +230,7 @@ def main(args):
         AdetCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
-        res = Trainer.test(cfg, model) # d2 defaults.py
+        res = Trainer.test(cfg, model)  # d2 defaults.py
         if comm.is_main_process():
             verify_results(cfg, res)
         if cfg.TEST.AUG.ENABLED:
@@ -220,6 +247,7 @@ def main(args):
         trainer.register_hooks(
             [hooks.EvalHook(0, lambda: trainer.test_with_TTA(cfg, trainer.model))]
         )
+    # trainer.checkpointer()
     return trainer.train()
 
 

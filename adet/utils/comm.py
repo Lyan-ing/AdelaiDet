@@ -79,7 +79,7 @@ def compute_ious(pred, target):
     target_bottom = target[:, 3]
 
     target_aera = (target_left + target_right) * \
-                  (target_top + target_bottom)
+                  (target_top + target_bottom)  # 中心距两侧距离
     pred_aera = (pred_left + pred_right) * \
                 (pred_top + pred_bottom)
 
@@ -98,6 +98,6 @@ def compute_ious(pred, target):
     area_union = target_aera + pred_aera - area_intersect
 
     ious = (area_intersect + 1.0) / (area_union + 1.0)
-    gious = ious - (ac_uion - area_union) / ac_uion
+    gious = ious - (ac_uion - area_union) / ac_uion  # iou-空比
 
     return ious, gious

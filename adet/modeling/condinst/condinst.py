@@ -79,9 +79,9 @@ class CondInst(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.device = torch.device(cfg.MODEL.DEVICE)
-
+        # print("we are CondInst and BoxInst")
         self.backbone = build_backbone(cfg)
-        self.proposal_generator = build_proposal_generator(cfg, self.backbone.output_shape())
+        self.proposal_generator = build_proposal_generator(cfg, self.backbone.output_shape())  # fcos
         self.mask_head = build_dynamic_mask_head(cfg)
         self.mask_branch = build_mask_branch(cfg, self.backbone.output_shape())
 
@@ -117,7 +117,7 @@ class CondInst(nn.Module):
 
         # normalize images
         images_norm = [self.normalizer(x) for x in original_images]
-        images_norm = ImageList.from_tensors(images_norm, self.backbone.size_divisibility)
+        images_norm = ImageList.from_tensors(images_norm, self.backbone.size_divisibility)  # 图像尺度归一化
 
         features = self.backbone(images_norm.tensor)
 
@@ -153,11 +153,11 @@ class CondInst(nn.Module):
 
         proposals, proposal_losses = self.proposal_generator(
             images_norm, features, gt_instances, self.controller
-        )
+        )  # fcos
 
         if self.training:
             mask_losses = self._forward_mask_heads_train(proposals, mask_feats, gt_instances)
-
+            # controller, mask feature, gt
             losses = {}
             losses.update(sem_losses)
             losses.update(proposal_losses)
@@ -209,7 +209,7 @@ class CondInst(nn.Module):
 
                 unique_gt_inds = instances_per_im.gt_inds.unique()
                 num_instances_per_gt = max(int(self.topk_proposals_per_im / len(unique_gt_inds)), 1)
-
+                # 只保留部分预测实例，保留策略与论文里的中心区域不同？？
                 for gt_ind in unique_gt_inds:
                     instances_per_gt = instances_per_im[instances_per_im.gt_inds == gt_ind]
 
@@ -223,12 +223,12 @@ class CondInst(nn.Module):
 
             pred_instances = Instances.cat(kept_instances)
 
-        pred_instances.mask_head_params = pred_instances.top_feats
+        pred_instances.mask_head_params = pred_instances.top_feats  # controller weights
 
         loss_mask = self.mask_head(
             mask_feats, self.mask_branch.out_stride,
             pred_instances, gt_instances
-        )
+        )  # dynamic_mask_head.__call__
 
         return loss_mask
 
@@ -313,7 +313,7 @@ class CondInst(nn.Module):
                 assert bitmask.size(1) * stride == im_w
 
                 per_im_bitmasks.append(bitmask)
-                per_im_bitmasks_full.append(bitmask_full)
+                per_im_bitmasks_full.append(bitmask_full)  # 由bbox生成伪mask
 
             per_im_gt_inst.gt_bitmasks = torch.stack(per_im_bitmasks, dim=0)
             per_im_gt_inst.gt_bitmasks_full = torch.stack(per_im_bitmasks_full, dim=0)

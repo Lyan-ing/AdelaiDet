@@ -34,7 +34,7 @@ class BlendMask(nn.Module):
         self.proposal_generator = build_proposal_generator(cfg, self.backbone.output_shape())
         self.blender = build_blender(cfg)
         self.basis_module = build_basis_module(cfg, self.backbone.output_shape())
-
+        print("we here, test weather register will run here !!!!!!!!-->no")
         # options when combining instance & semantic outputs
         self.combine_on = cfg.MODEL.PANOPTIC_FPN.COMBINE.ENABLED
         if self.combine_on:

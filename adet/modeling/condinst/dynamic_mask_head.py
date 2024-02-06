@@ -150,7 +150,7 @@ class DynamicMaskHead(nn.Module):
             )
             if i < n_layers - 1:
                 x = F.relu(x)
-        return x
+        return x  # mask head output
 
     def mask_heads_forward_with_coords(
             self, mask_feats, mask_feat_stride, instances
@@ -187,7 +187,7 @@ class DynamicMaskHead(nn.Module):
             self.weight_nums, self.bias_nums
         )
 
-        mask_logits = self.mask_heads_forward(mask_head_inputs, weights, biases, n_inst)
+        mask_logits = self.mask_heads_forward(mask_head_inputs, weights, biases, n_inst)  # 获得controller的参数
 
         mask_logits = mask_logits.reshape(-1, 1, H, W)
 
@@ -201,15 +201,15 @@ class DynamicMaskHead(nn.Module):
         if self.training:
             self._iter += 1
 
-            gt_inds = pred_instances.gt_inds
+            gt_inds = pred_instances.gt_inds  # 预测实例对应真实实例的索引（一个batch所有图像的所有实例数）
             gt_bitmasks = torch.cat([per_im.gt_bitmasks for per_im in gt_instances])
-            gt_bitmasks = gt_bitmasks[gt_inds].unsqueeze(dim=1).to(dtype=mask_feats.dtype)
+            gt_bitmasks = gt_bitmasks[gt_inds].unsqueeze(dim=1).to(dtype=mask_feats.dtype)  # 获取预测实例应当对应的mask
 
             losses = {}
 
             if len(pred_instances) == 0:
                 dummy_loss = mask_feats.sum() * 0 + pred_instances.mask_head_params.sum() * 0
-                if not self.boxinst_enabled:
+                if not self.boxinst_enabled:  #         controller weights
                     losses["loss_mask"] = dummy_loss
                 else:
                     losses["loss_prj"] = dummy_loss

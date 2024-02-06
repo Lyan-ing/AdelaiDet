@@ -9,7 +9,7 @@ from detectron2.layers import ShapeSpec
 
 from adet.layers import conv_with_kaiming_uniform
 from adet.utils.comm import aligned_bilinear
-
+import torchshow as ts
 
 INF = 100000000
 
@@ -28,13 +28,14 @@ class MaskBranch(nn.Module):
         num_convs = cfg.MODEL.CONDINST.MASK_BRANCH.NUM_CONVS
         channels = cfg.MODEL.CONDINST.MASK_BRANCH.CHANNELS
         self.out_stride = input_shape[self.in_features[0]].stride
+        self.pred_depth = cfg.MODEL.BOXINST.PAIRWISE.PRED_DEPTH
 
         feature_channels = {k: v.channels for k, v in input_shape.items()}
 
         conv_block = conv_with_kaiming_uniform(norm, activation=True)
 
         self.refine = nn.ModuleList()
-        for in_feature in self.in_features:
+        for in_feature in self.in_features:  # mask branch
             self.refine.append(conv_block(
                 feature_channels[in_feature],
                 channels, 3, 1
@@ -67,6 +68,23 @@ class MaskBranch(nn.Module):
             bias_value = -math.log((1 - prior_prob) / prior_prob)
             torch.nn.init.constant_(self.logits.bias, bias_value)
 
+        if self.pred_depth:
+            # num_classes = cfg.MODEL.FCOS.NUM_CLASSES
+            # self.focal_loss_alpha = cfg.MODEL.FCOS.LOSS_ALPHA
+            # self.focal_loss_gamma = cfg.MODEL.FCOS.LOSS_GAMMA
+
+            # in_channels = feature_channels[self.in_features[0]]
+            self.depth_head = nn.Sequential(
+                conv_block(16, 8, kernel_size=3, stride=1),
+                conv_block(8, 1, kernel_size=3, stride=1)
+            )
+
+                # self.logits = nn.Conv2d(channels, num_classes, kernel_size=1, stride=1)
+
+                # prior_prob = cfg.MODEL.FCOS.PRIOR_PROB
+                # bias_value = -math.log((1 - prior_prob) / prior_prob)
+                # torch.nn.init.constant_(self.logits.bias, bias_value)
+
     def forward(self, features, gt_instances=None):
         for i, f in enumerate(self.in_features):
             if i == 0:
@@ -81,7 +99,7 @@ class MaskBranch(nn.Module):
                 factor_h, factor_w = target_h // h, target_w // w
                 assert factor_h == factor_w
                 x_p = aligned_bilinear(x_p, factor_h)
-                x = x + x_p
+                x = x + x_p  # 三层的特征相加
 
         mask_feats = self.tower(x)
 
@@ -93,7 +111,7 @@ class MaskBranch(nn.Module):
         if self.training and self.sem_loss_on:
             logits_pred = self.logits(self.seg_head(
                 features[self.in_features[0]]
-            ))
+            ))  # p3的特征图上算一次sem loss
 
             # compute semantic targets
             semantic_targets = []
@@ -134,5 +152,9 @@ class MaskBranch(nn.Module):
                 reduction="sum",
             ) / num_pos
             losses['loss_sem'] = loss_sem
+        depth_pred = None
+        if self.training and self.pred_depth:
+            depth_pred = self.depth_head(mask_feats)
 
+            return mask_feats, losses, depth_pred
         return mask_feats, losses

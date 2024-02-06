@@ -19,7 +19,7 @@ from .detection_utils import (annotations_to_instances, build_augmentation,
                               transform_instance_annotations)
 
 from adet.data.detection_utils import HeatmapGenerator
-from adet.data.dataset_mapper import DatasetMapperWithBasis
+from .my_dataset_mapper import DatasetMapperWithBasis
 """
 This file contains the default mapping that's applied to "dataset dicts".
 """

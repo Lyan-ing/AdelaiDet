@@ -1,7 +1,6 @@
 from detectron2.config.defaults import _C
 from detectron2.config import CfgNode as CN
 
-
 # ---------------------------------------------------------------------------- #
 # Additional Configs
 # ---------------------------------------------------------------------------- #
@@ -11,6 +10,7 @@ _C.MODEL.RESNETS.DEFORM_INTERVAL = 1
 _C.INPUT.HFLIP_TRAIN = True
 _C.INPUT.CROP.CROP_INSTANCE = True
 _C.INPUT.IS_ROTATE = False
+_C.MODEL.INTERRUPT = True
 
 # ---------------------------------------------------------------------------- #
 # FCOS Head
@@ -52,7 +52,7 @@ _C.MODEL.FCOS.LOSS_GAMMA = 2.0
 # "moving_fg" (normalized by the MOVING number of the foreground samples),
 # or "all" (normalized by the number of all samples)
 _C.MODEL.FCOS.LOSS_NORMALIZER_CLS = "fg"
-_C.MODEL.FCOS.LOSS_WEIGHT_CLS = 1.0
+_C.MODEL.FCOS.LOSS_WEIGHT_CLS = [1.0, 1.0]
 
 _C.MODEL.FCOS.SIZES_OF_INTEREST = [64, 128, 256, 512]
 _C.MODEL.FCOS.USE_RELU = True
@@ -108,8 +108,8 @@ _C.MODEL.BATEXT.RECOGNIZER = "attn"
 _C.MODEL.BATEXT.CANONICAL_SIZE = 96  # largest min_size for level 3 (stride=8)
 _C.MODEL.BATEXT.USE_COORDCONV = False
 _C.MODEL.BATEXT.USE_AET = False
-_C.MODEL.BATEXT.EVAL_TYPE = 3 # 1: G; 2: W; 3: S
-_C.MODEL.BATEXT.CUSTOM_DICT = "" # Path to the class file.
+_C.MODEL.BATEXT.EVAL_TYPE = 3  # 1: G; 2: W; 3: S
+_C.MODEL.BATEXT.CUSTOM_DICT = ""  # Path to the class file.
 
 # ---------------------------------------------------------------------------- #
 # BlendMask Options
@@ -206,7 +206,7 @@ _C.MODEL.MEInst.DIM_MASK = 60
 _C.MODEL.MEInst.MASK_SIZE = 28
 # The default path for parameters of mask encoding.
 _C.MODEL.MEInst.PATH_COMPONENTS = "datasets/coco/components/" \
-                                   "coco_2017_train_class_agnosticTrue_whitenTrue_sigmoidTrue_60.npz"
+                                  "coco_2017_train_class_agnosticTrue_whitenTrue_sigmoidTrue_60.npz"
 # An indicator for encoding parameters loading during training.
 _C.MODEL.MEInst.FLAG_PARAMETERS = False
 # The loss for mask branch, can be mse now.
@@ -253,13 +253,34 @@ _C.MODEL.CONDINST.MASK_BRANCH.SEMANTIC_LOSS_ON = False
 _C.MODEL.BOXINST = CN()
 # Whether to enable BoxInst
 _C.MODEL.BOXINST.ENABLED = False
-_C.MODEL.BOXINST.BOTTOM_PIXELS_REMOVED = 10
+_C.MODEL.BOXINST.BOTTOM_PIXELS_REMOVED = 0
 
 _C.MODEL.BOXINST.PAIRWISE = CN()
 _C.MODEL.BOXINST.PAIRWISE.SIZE = 3
 _C.MODEL.BOXINST.PAIRWISE.DILATION = 2
-_C.MODEL.BOXINST.PAIRWISE.WARMUP_ITERS = 10000
-_C.MODEL.BOXINST.PAIRWISE.COLOR_THRESH = 0.3
+_C.MODEL.BOXINST.PAIRWISE.WARMUP_ITERS = 1000
+_C.MODEL.BOXINST.PAIRWISE.COLOR_THRESH = 0.4
+_C.MODEL.BOXINST.PAIRWISE.USE_DEPTH = False
+_C.MODEL.BOXINST.PAIRWISE.DEPTH_THRESH = 50
+_C.MODEL.BOXINST.PAIRWISE.DEPTH_SIM_THRESH = 0.8
+_C.MODEL.BOXINST.PAIRWISE.HYPERS = [1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+_C.MODEL.BOXINST.PAIRWISE.MASK = [1.0, 0.0]
+_C.MODEL.BOXINST.PAIRWISE.DEPTH_WITH_BOX = False
+_C.MODEL.BOXINST.PAIRWISE.DEPTH_BG = 0
+_C.MODEL.BOXINST.PAIRWISE.PRED_DEPTH = 0.0
+_C.MODEL.BOXINST.PAIRWISE.KMEAN = [0, 20, 1.0]
+_C.MODEL.BOXINST.EDGE_THRESH = 0.1
+_C.MODEL.BOXINST.DILATIONS = [1, 2]
+_C.MODEL.BOXINST.PRED_EDGE = 0.1
+_C.MODEL.BOXINST.TMP = True
+_C.MODEL.BOXINST.CROSS = 'normal'
+_C.MODEL.BOXINST.PSEUDO_DEPTH = False
+_C.MODEL.BOXINST.SEMSUPER = [500, 1000000]
+_C.MODEL.BOXINST.SEMSUPER_THRESHOLD = [0.5, 0.1]
+_C.MODEL.BOXINST.TEACHER_UPDATE_ITER = 1
+_C.MODEL.BOXINST.TEACHER_EMA_KEEP_RATE = [0.999, 0.3]
+_C.MODEL.BOXINST.MASK_FEATURE_PARA = 0.0
+_C.MODEL.BOXINST.PASTE_CHOICE = [0,1,2]
 
 # ---------------------------------------------------------------------------- #
 # TOP Module Options
@@ -335,6 +356,13 @@ _C.MODEL.SOLOV2.LOSS.FOCAL_GAMMA = 2.0
 _C.MODEL.SOLOV2.LOSS.FOCAL_WEIGHT = 1.0
 _C.MODEL.SOLOV2.LOSS.DICE_WEIGHT = 3.0
 
+_C.MODEL.SOLOV2.FREEZE = False
+_C.MODEL.SOLOV2.IS_FREEMASK = False
+_C.MODEL.SOLOV2.USE_DEPTH = True
+_C.MODEL.SOLOV2.DEPTH_SIM_THRESH = 0.9
+_C.MODEL.SOLOV2.LOSS.BG = 10.0
+_C.MODEL.SOLOV2.LOSS.HYPERS = [1.0, 0.5, 1.0, 5.0]
+_C.MODEL.SOLOV2.LOSS.DEPTH_WITH_BOX = True
 
 # ---------------------------------------------------------------------------- #
 # FCPose Options
@@ -362,3 +390,5 @@ _C.MODEL.FCPOSE.BASIS_MODULE.COMMON_STRIDE = 8
 _C.MODEL.FCPOSE.BASIS_MODULE.NUM_CLASSES = 17
 _C.MODEL.FCPOSE.BASIS_MODULE.LOSS_WEIGHT = 0.2
 _C.MODEL.FCPOSE.BASIS_MODULE.BN_TYPE = "SyncBN"
+
+_C.TEST.MODEL = "modelTeacher"

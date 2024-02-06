@@ -20,12 +20,14 @@ import os
 from collections import OrderedDict
 import torch
 from torch.nn.parallel import DistributedDataParallel
+# if os.path.exists('../configs/BoxInst/MS_R_101_1x.yaml'):
+#     print("True!")
+# else:
+#     print("False")
+
 import detectron2.utils.comm as comm
 from detectron2.data import MetadataCatalog, build_detection_train_loader
-# from detectron2.data import MetadataCatalog
-# from adet.data.build import build_detection_train_loader
-from detectron2.engine import DefaultTrainer, default_argument_parser, default_setup, hooks, launch
-from detectron2.engine import AMPTrainer, SimpleTrainer, TrainerBase
+from detectron2.engine import hooks, launch
 from detectron2.utils.events import EventStorage
 from detectron2.evaluation import (
     COCOEvaluator,
@@ -38,58 +40,20 @@ from detectron2.evaluation import (
 )
 from detectron2.modeling import GeneralizedRCNNWithTTA
 from detectron2.utils.logger import setup_logger
-from detectron2.checkpoint import DetectionCheckpointer
-from detectron2.utils.env import TORCH_VERSION
-from adet.data.my_dataset_mapper_p2m import DatasetMapperWithBasis
+
+from adet.data.my_dataset_mapper import DatasetMapperWithBasis
 from adet.data.fcpose_dataset_mapper import FCPoseDatasetMapper
 from adet.config import get_cfg
-from adet.checkpoint import AdetCheckpointer, Checkpoint_With_Interrupt
+from adet.checkpoint import AdetCheckpointer
 from adet.evaluation import TextEvaluator
-from detectron2.engine.defaults import default_writers
-import warnings
-warnings.filterwarnings("ignore")
+from adet.defaults2 import MyDefaultTrainer, mydefault_argument_parser, mydefault_setup
 
 
-class Trainer(DefaultTrainer):
+class Trainer(MyDefaultTrainer):
     """
     This is the same Trainer except that we rewrite the
     `build_train_loader`/`resume_or_load` method.
     """
-    def __init__(self, cfg):
-        """
-        Args:
-            cfg (CfgNode):
-        Use the custom checkpointer, which loads other backbone models
-        with matching heuristics.
-        """
-        cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
-        data_loader = self.build_train_loader(cfg)
-        model = self.build_model(cfg)
-        optimizer = self.build_optimizer(cfg, model)
-        # data_loader = self.build_train_loader(cfg)
-
-        if comm.get_world_size() > 1:
-            model = DistributedDataParallel(
-                model, device_ids=[comm.get_local_rank()], broadcast_buffers=False, find_unused_parameters=True
-            )
-
-        TrainerBase.__init__(self)
-        self._trainer = (AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer)(
-            model, data_loader, optimizer
-        )  # init trainer
-
-        self.scheduler = self.build_lr_scheduler(cfg, optimizer)  # init lr_scheduler
-        self.checkpointer = DetectionCheckpointer(
-            model,
-            cfg.OUTPUT_DIR,
-            optimizer=optimizer,
-            scheduler=self.scheduler,
-        )
-        self.start_iter = 0
-        self.max_iter = cfg.SOLVER.MAX_ITER
-        self.cfg = cfg
-
-        self.register_hooks(self.build_hooks())  # how to use the hook? and how to register?
 
     def build_hooks(self):
         """
@@ -101,29 +65,19 @@ class Trainer(DefaultTrainer):
         ret = super().build_hooks()
         for i in range(len(ret)):
             if isinstance(ret[i], hooks.PeriodicCheckpointer):
-                # print("*-*")
                 self.checkpointer = AdetCheckpointer(
                     self.model,
                     self.cfg.OUTPUT_DIR,
                     optimizer=self.optimizer,
                     scheduler=self.scheduler,
                 )
-                if self.cfg.MODEL.INTERRUPT:
-                    ret[i] = Checkpoint_With_Interrupt(self.checkpointer, self.cfg.SOLVER.CHECKPOINT_PERIOD)
-                else:
-                    ret[i] = hooks.PeriodicCheckpointer(self.checkpointer, self.cfg.SOLVER.CHECKPOINT_PERIOD)
+                ret[i] = hooks.PeriodicCheckpointer(self.checkpointer, self.cfg.SOLVER.CHECKPOINT_PERIOD)
         return ret
 
     def resume_or_load(self, resume=True):
         checkpoint = self.checkpointer.resume_or_load(self.cfg.MODEL.WEIGHTS, resume=resume)
         if resume and self.checkpointer.has_checkpoint():
             self.start_iter = checkpoint.get("iteration", -1) + 1
-        if isinstance(self.model, DistributedDataParallel):
-            # broadcast loaded data/model from the first rank, because other
-            # machines may not have access to the checkpoint file
-            if TORCH_VERSION >= (1, 7):
-                self.model._sync_params_and_buffers()
-            self.start_iter = comm.all_gather(self.start_iter)[0]
 
     def train_loop(self, start_iter: int, max_iter: int):
         """
@@ -141,7 +95,6 @@ class Trainer(DefaultTrainer):
             for self.iter in range(start_iter, max_iter):
                 self.before_step()
                 self.run_step()
-                # print(self.iter)
                 self.after_step()
             self.after_train()
 
@@ -153,7 +106,10 @@ class Trainer(DefaultTrainer):
             OrderedDict of results, if evaluation is enabled. Otherwise None.
         """
         self.train_loop(self.start_iter, self.max_iter)
+        # rank = torch.distributed.get_rank()
 
+        # if rank==0 and hfai.receive_suspend_command():
+        #     self.checkpointer()
         if hasattr(self, "_last_eval_results") and comm.is_main_process():
             verify_results(self.cfg, self._last_eval_results)
             return self._last_eval_results
@@ -232,30 +188,16 @@ class Trainer(DefaultTrainer):
         res = OrderedDict({k + "_TTA": v for k, v in res.items()})
         return res
 
-    def build_writers(self):
-        """
-        Build a list of writers to be used using :func:`default_writers()`.
-        If you'd like a different list of writers, you can overwrite it in
-        your trainer.
-
-        Returns:
-            list[EventWriter]: a list of :class:`EventWriter` objects.
-        """
-        # pre = (self.cfg.OUTPUT_DIR).split('/')[:-1]
-        suf = (self.cfg.OUTPUT_DIR).split('/')[-1]
-        log_dir = (self.cfg.OUTPUT_DIR).replace(suf, 'tensorboard/' + suf)
-        return default_writers(log_dir, self.max_iter)
-
 
 def setup(args):
     """
     Create configs and perform basic setups.
     """
-    cfg = get_cfg()
+    cfg = get_cfg()  # Default values are the mean pixel value from ImageNet: [103.53, 116.28, 123.675]
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()
-    default_setup(cfg, args)
+    mydefault_setup(cfg, args)
 
     rank = comm.get_rank()
     setup_logger(cfg.OUTPUT_DIR, distributed_rank=rank, name="adet")
@@ -293,7 +235,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = default_argument_parser().parse_args()
+    args = mydefault_argument_parser().parse_args()
     print("Command Line Args:", args)
     launch(
         main,
