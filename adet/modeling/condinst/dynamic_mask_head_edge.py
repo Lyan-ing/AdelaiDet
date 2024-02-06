@@ -1,0 +1,401 @@
+from copy import deepcopy
+
+import torch
+from torch.nn import functional as F
+from torch import nn
+
+from adet.utils.comm import compute_locations, aligned_bilinear
+import torchshow as ts
+from adet.utils.kmean_gpu import kmeans
+
+
+def compute_project_term(mask_scores, gt_bitmasks):
+    mask_losses_y = dice_coefficient(
+        mask_scores.max(dim=2, keepdim=True)[0],
+        gt_bitmasks.max(dim=2, keepdim=True)[0]
+    )
+    mask_losses_x = dice_coefficient(
+        mask_scores.max(dim=3, keepdim=True)[0],
+        gt_bitmasks.max(dim=3, keepdim=True)[0]
+    )
+    return (mask_losses_x + mask_losses_y).mean()
+
+
+def compute_all_project_term(mask_scores, depth_cob_box):
+    # mask_losses_y = dice_coefficient(
+    #     mask_scores.max(dim=2, keepdim=True)[0],
+    #     gt_bitmasks.max(dim=2, keepdim=True)[0]
+    # )
+    # mask_losses_x = dice_coefficient(
+    #     mask_scores.max(dim=3, keepdim=True)[0],
+    #     gt_bitmasks.max(dim=3, keepdim=True)[0]
+    # )
+    mask_losses_y = dice_coefficient(
+        mask_scores.min(dim=2, keepdim=True)[0],
+        depth_cob_box.min(dim=2, keepdim=True)[0]
+    )
+    mask_losses_x = dice_coefficient(
+        mask_scores.min(dim=3, keepdim=True)[0],
+        depth_cob_box.min(dim=3, keepdim=True)[0]
+    )
+    return (mask_losses_x + mask_losses_y).mean()
+
+
+def compute_pairwise_term(mask_logits, pairwise_size, pairwise_dilation):
+    assert mask_logits.dim() == 4
+
+    log_fg_prob = F.logsigmoid(mask_logits)
+    log_bg_prob = F.logsigmoid(-mask_logits)
+
+    from adet.modeling.condinst.condinst import unfold_wo_center
+    log_fg_prob_unfold = unfold_wo_center(
+        log_fg_prob, kernel_size=pairwise_size,
+        dilation=pairwise_dilation
+    )
+    log_bg_prob_unfold = unfold_wo_center(
+        log_bg_prob, kernel_size=pairwise_size,
+        dilation=pairwise_dilation
+    )
+
+    # the probability of making the same prediction = p_i * p_j + (1 - p_i) * (1 - p_j)
+    # we compute the the probability in log space to avoid numerical instability
+    log_same_fg_prob = log_fg_prob[:, :, None] + log_fg_prob_unfold
+    log_same_bg_prob = log_bg_prob[:, :, None] + log_bg_prob_unfold
+
+    max_ = torch.max(log_same_fg_prob, log_same_bg_prob)
+    log_same_prob = torch.log(
+        torch.exp(log_same_fg_prob - max_) +
+        torch.exp(log_same_bg_prob - max_)
+    ) + max_
+
+    # loss = -log(prob)
+    return -log_same_prob[:, 0]
+
+
+def dice_coefficient(x, target):
+    eps = 1e-5
+    n_inst = x.size(0)
+    x = x.reshape(n_inst, -1)
+    target = target.reshape(n_inst, -1)
+    intersection = (x * target).sum(dim=1)
+    union = (x ** 2.0).sum(dim=1) + (target ** 2.0).sum(dim=1) + eps
+    loss = 1. - (2 * intersection / union)
+    return loss
+
+
+def parse_dynamic_params(params, channels, weight_nums, bias_nums):
+    assert params.dim() == 2
+    assert len(weight_nums) == len(bias_nums)
+    assert params.size(1) == sum(weight_nums) + sum(bias_nums)
+
+    num_insts = params.size(0)
+    num_layers = len(weight_nums)
+
+    params_splits = list(torch.split_with_sizes(
+        params, weight_nums + bias_nums, dim=1
+    ))
+
+    weight_splits = params_splits[:num_layers]
+    bias_splits = params_splits[num_layers:]
+
+    for l in range(num_layers):
+        if l < num_layers - 1:
+            # out_channels x in_channels x 1 x 1
+            weight_splits[l] = weight_splits[l].reshape(num_insts * channels, -1, 1, 1)
+            bias_splits[l] = bias_splits[l].reshape(num_insts * channels)
+        else:
+            # out_channels x in_channels x 1 x 1
+            weight_splits[l] = weight_splits[l].reshape(num_insts * 1, -1, 1, 1)
+            bias_splits[l] = bias_splits[l].reshape(num_insts)
+
+    return weight_splits, bias_splits
+
+
+def build_dynamic_mask_head(cfg):
+    return DynamicMaskHead(cfg)
+
+
+class DynamicMaskHead(nn.Module):
+    def __init__(self, cfg):
+        super(DynamicMaskHead, self).__init__()
+        self.num_layers = cfg.MODEL.CONDINST.MASK_HEAD.NUM_LAYERS
+        self.channels = cfg.MODEL.CONDINST.MASK_HEAD.CHANNELS
+        self.in_channels = cfg.MODEL.CONDINST.MASK_BRANCH.OUT_CHANNELS
+        self.mask_out_stride = cfg.MODEL.CONDINST.MASK_OUT_STRIDE
+        self.disable_rel_coords = cfg.MODEL.CONDINST.MASK_HEAD.DISABLE_REL_COORDS
+
+        soi = cfg.MODEL.FCOS.SIZES_OF_INTEREST
+        self.register_buffer("sizes_of_interest", torch.tensor(soi + [soi[-1] * 2]))
+
+        # boxinst configs
+        self.boxinst_enabled = cfg.MODEL.BOXINST.ENABLED
+        self.bottom_pixels_removed = cfg.MODEL.BOXINST.BOTTOM_PIXELS_REMOVED
+        self.pairwise_size = cfg.MODEL.BOXINST.PAIRWISE.SIZE
+        self.pairwise_dilation = cfg.MODEL.BOXINST.PAIRWISE.DILATION
+        self.pairwise_color_thresh = cfg.MODEL.BOXINST.PAIRWISE.COLOR_THRESH
+        self._warmup_iters = cfg.MODEL.BOXINST.PAIRWISE.WARMUP_ITERS
+        # self.use_depth = cfg.MODEL.BOXINST.PAIRWISE.USE_DEPTH
+        self.depth_thresh = cfg.MODEL.BOXINST.PAIRWISE.DEPTH_THRESH
+        self.pairwise_depth_thresh = cfg.MODEL.BOXINST.PAIRWISE.DEPTH_SIM_THRESH
+        self.hpyer_parameters = cfg.MODEL.BOXINST.PAIRWISE.HYPERS
+        self.depth_with_box = cfg.MODEL.BOXINST.PAIRWISE.DEPTH_WITH_BOX
+        self.depth_cob_sim = False
+        self.bg_depth = cfg.MODEL.BOXINST.PAIRWISE.DEPTH_BG
+
+        weight_nums, bias_nums = [], []
+        for l in range(self.num_layers):
+            if l == 0:
+                if not self.disable_rel_coords:
+                    weight_nums.append((self.in_channels + 2) * self.channels)
+                else:
+                    weight_nums.append(self.in_channels * self.channels)
+                bias_nums.append(self.channels)
+            elif l == self.num_layers - 1:
+                weight_nums.append(self.channels * 1)
+                bias_nums.append(1)
+            else:
+                weight_nums.append(self.channels * self.channels)
+                bias_nums.append(self.channels)
+
+        self.weight_nums = weight_nums
+        self.bias_nums = bias_nums
+        self.num_gen_params = sum(weight_nums) + sum(bias_nums)
+
+        self.register_buffer("_iter", torch.zeros([1]))
+
+    def mask_heads_forward(self, features, weights, biases, num_insts):
+        '''
+        :param features
+        :param weights: [w0, w1, ...]
+        :param bias: [b0, b1, ...]
+        :return:
+        '''
+        assert features.dim() == 4
+        n_layers = len(weights)
+        x = features
+        for i, (w, b) in enumerate(zip(weights, biases)):
+            x = F.conv2d(
+                x, w, bias=b,
+                stride=1, padding=0,
+                groups=num_insts
+            )
+            if i < n_layers - 1:
+                x = F.relu(x)
+        return x  # mask head output
+
+    def mask_heads_forward_with_coords(
+            self, mask_feats, mask_feat_stride, instances
+    ):
+        locations = compute_locations(
+            mask_feats.size(2), mask_feats.size(3),
+            stride=mask_feat_stride, device=mask_feats.device
+        )
+        n_inst = len(instances)
+
+        im_inds = instances.im_inds
+        mask_head_params = instances.mask_head_params
+
+        N, _, H, W = mask_feats.size()
+
+        if not self.disable_rel_coords:
+            instance_locations = instances.locations
+            relative_coords = instance_locations.reshape(-1, 1, 2) - locations.reshape(1, -1, 2)
+            relative_coords = relative_coords.permute(0, 2, 1).float()
+            soi = self.sizes_of_interest.float()[instances.fpn_levels]
+            relative_coords = relative_coords / soi.reshape(-1, 1, 1)
+            relative_coords = relative_coords.to(dtype=mask_feats.dtype)
+
+            mask_head_inputs = torch.cat([
+                relative_coords, mask_feats[im_inds].reshape(n_inst, self.in_channels, H * W)
+            ], dim=1)
+        else:
+            mask_head_inputs = mask_feats[im_inds].reshape(n_inst, self.in_channels, H * W)
+
+        mask_head_inputs = mask_head_inputs.reshape(1, -1, H, W)
+
+        weights, biases = parse_dynamic_params(
+            mask_head_params, self.channels,
+            self.weight_nums, self.bias_nums
+        )
+
+        mask_logits = self.mask_heads_forward(mask_head_inputs, weights, biases, n_inst)  # 获得controller的参数
+
+        mask_logits = mask_logits.reshape(-1, 1, H, W)
+
+        assert mask_feat_stride >= self.mask_out_stride
+        assert mask_feat_stride % self.mask_out_stride == 0
+        mask_logits = aligned_bilinear(mask_logits, int(mask_feat_stride / self.mask_out_stride))
+
+        return mask_logits
+
+    def __call__(self, mask_feats, mask_feat_stride, pred_instances, gt_instances=None, depth_prediction=None):
+        if self.training:
+            self._iter += 1
+
+            gt_inds = pred_instances.gt_inds  # 预测实例对应真实实例的索引（一个batch所有图像的所有实例数）
+            im_inds = pred_instances.im_inds  # 实例对应图像索引
+            gt_bitmasks = torch.cat([per_im.gt_bitmasks for per_im in gt_instances])
+            gt_bitmasks = gt_bitmasks[gt_inds].unsqueeze(dim=1).to(dtype=mask_feats.dtype)  # 获取预测实例应当对应的mask
+            # gt_depth = depth_prediction[im_inds].to(dtype=mask_feats.dtype)  # 每张图对应的gt_depth
+
+            losses = {}
+
+            if len(pred_instances) == 0:
+                dummy_loss = mask_feats.sum() * 0 + pred_instances.mask_head_params.sum() * 0
+                if not self.boxinst_enabled:  # controller weights
+                    losses["loss_mask"] = dummy_loss
+                else:
+                    losses["loss_prj"] = dummy_loss
+                    losses["loss_pairwise"] = dummy_loss
+            else:
+                mask_logits = self.mask_heads_forward_with_coords(
+                    mask_feats, mask_feat_stride, pred_instances
+                )
+                mask_scores = mask_logits.sigmoid()
+                # ins_idx = mask_scores.max(dim=0)[1][0]
+                # mask_label = torch.zeros_like(mask_scores).squeeze(1)
+                # # mask_label = mask_label.permute(1,2,0)
+                # a = mask_label.view(mask_label.shape[0]*mask_label.shape[1],-1)
+                # mask_label[:,:,gt_inds==]
+
+
+                # import matplotlib.pyplot as plt
+                if self.bg_depth:
+                    depth_prediction_bg = depth_prediction[:, :, ::2, ::2]
+                    feature_depth_matrix = (depth_prediction_bg < self.bg_depth).float()
+                    depth_norm = (self.bg_depth - depth_prediction_bg) / self.bg_depth
+                    loss_feature_depth = (feature_depth_matrix * depth_norm * mask_feats.mean(1,
+                                                                                              True).sigmoid()).sum() / feature_depth_matrix.sum().clamp(
+                        min=1)
+                    losses.update({
+                        'loss_feature_bg': loss_feature_depth,
+                    })
+                # for i in range(gt_inds.max()):
+                #     idx = (gt_inds<i).sum()
+                #     pred_mask = (mask_scores[idx, 0]>0.5)
+                #     depth = depth_prediction[im_inds[idx], 0]
+                #     mask = torch.zeros_like(depth)
+                #     depth_mask = depth[pred_mask]
+                #     # unqiue_x, num = torch.unique(depth_mask, return_counts=True)
+                #     # plt.plot(unqiue_x.cpu(), num.cpu())
+                #     plt.hist(depth_mask.cpu(), 10)
+                #     plt.savefig(f'/home/yl/tmp/vis/{file_name}_{idx}_point.png')
+                #     # plt.imsave(f'/home/yl/tmp/vis/5_{idx}_point.png', plt.scatter(unqiue_x.cpu(), num.cpu()))
+                #
+                #     kmeans_pred_mask, center, flag = kmeans(depth_mask.unsqueeze(dim =1), num_clusters=2)
+                #
+                #     mask[pred_mask] = (kmeans_pred_mask +1).float()
+                #     ts.save(mask, f'/home/yl/tmp/vis/{file_name}_{idx}.png')
+
+                if self.boxinst_enabled:
+                    warmup_factor = min(self._iter.item() / float(self._warmup_iters), 1.0)
+                    # box-supervised BoxInst losses
+                    image_color_similarity = torch.cat([x.image_color_similarity for x in gt_instances])
+                    image_color_similarity = image_color_similarity[gt_inds].to(dtype=mask_feats.dtype)
+
+                    loss_prj_term = compute_project_term(mask_scores, gt_bitmasks)
+
+                    pairwise_losses = compute_pairwise_term(
+                        mask_logits, self.pairwise_size,
+                        self.pairwise_dilation
+                    )
+
+                    weights = (image_color_similarity >= self.pairwise_color_thresh).float() * gt_bitmasks.float()
+                    loss_pairwise = (pairwise_losses * weights).sum() / weights.sum().clamp(min=1.0)
+
+                    # warmup_factor = min(self._iter.item() / float(self._warmup_iters), 1.0)
+                    loss_pairwise = loss_pairwise * warmup_factor * self.hpyer_parameters[0]
+
+                    # add depth estimation weak supervised loss
+                    # depth 八邻域，与color相似处理
+                    # depth 接阈值，处理前背景
+                    # depth 边缘，内部变化率
+
+                    losses.update({
+                        "loss_prj": loss_prj_term,
+                        "loss_pairwise": loss_pairwise,
+                    })
+                    # im_inds = None
+                    gt_depth = None
+                    if self.depth_thresh:
+                        im_inds = pred_instances.im_inds  # 实例对应图像索引
+                        gt_depth = depth_prediction[im_inds].to(dtype=mask_feats.dtype)  # 每张图对应的gt_depth
+
+                        # if self.depth_edge:
+                        depth_edge = torch.cat([x.depth_edge for x in gt_instances])
+                        depth_edge = depth_edge[gt_inds].to(dtype=mask_feats.dtype)
+                        depth_bitmask = gt_bitmasks
+                        depth_edge_matrix = (depth_edge.unsqueeze(
+                            1) > self.depth_thresh).float() * depth_bitmask.float()
+                        edge_sum = depth_edge_matrix.sum(dim=(1, 2, 3))
+                        depth_bitmask[edge_sum < 10] = 0
+                        # depth_bitmask.sum()
+                        # ts.save(depth_edge_matrix[0], './edge_matrix')
+                        depth_edge_value = depth_edge_matrix * gt_depth
+                        # for i in range(len(depth_edge_value)):
+                        #     ts.save(depth_edge_value[i] / 255, './tmp/edge_value_' + str(i))
+                        # ts.save(depth_edge_value[0]/255, './edge_value')
+                        depth_edge_mean = (
+                                depth_edge_value.sum(3, True) / depth_edge_matrix.sum(3, True).clamp(min=1)).expand(
+                            depth_edge_value.shape)
+                        # for i in range(len(depth_bitmask)):
+                        #     ts.save(depth_bitmask[i], './tmp/bitmask_ori_' + str(i))
+                        # ts.save(depth_edge_mean[i], './tmp/mean_'+str(i))
+                        # ts.save(depth_bitmask[0], './bitmask')
+                        # ts.save(depth_edge_mean[0],'./mean')
+                        depth_bitmask[gt_depth <= depth_edge_mean] = 0
+                        # ins_num = gt_inds.unique()
+                        # ts.save(depth_bitmask, file_root + '/depth_bitmask.png')
+                        # ts.save(depth_edge_matrix, file_root + '/depth_edge_matrix.png')
+                        # ts.save(depth_edge_value, file_root + '/depth_edge_value.png')
+                        # for i in ins_num:
+                        #     idx = (gt_inds < i).sum()
+                        #     iddx = str(int(idx))
+                        #     ts.save(depth_bitmask[idx], file_root+'/depth_bitmask_'+iddx+'.png')
+                        #     ts.save(depth_edge_matrix[idx], file_root + '/depth_edge_matrix_' + iddx + '.png')
+                        #     ts.save(depth_edge_value[idx], file_root + '/depth_edge_value_' + iddx + '.png')
+                        # for i in range(len(depth_bitmask)):
+                        #     ts.save(depth_bitmask[i], './tmp/bitmask_' + str(i))
+                        # ts.save(depth_bitmask[0], './bitmask_2')
+                        # loss_edge = (pairwise_losses * depth_bitmask).mean(1).sum() / depth_bitmask.sum().clamp(min=1)
+                        # loss_edge = torch.log(loss_edge+1)
+
+                        # loss_edge = F.l1_loss(mask_scores, depth_bitmask)
+
+                        # warmup_factor1 = min((self._iter.item() - 40000) / float(self._warmup_iters), 1.0)
+
+                        depth_proj = compute_all_project_term(mask_scores, depth_bitmask)
+                        losses.update({
+                            # 'loss_edge': loss_edge * self.hpyer_parameters[1] * warmup_factor,
+                            'loss_depth_proj': depth_proj,
+                        })
+
+                    if (self._iter > self._warmup_iters) and self.pairwise_depth_thresh:
+                        image_depth_similarity = torch.cat([x.image_depth_similarity for x in gt_instances])
+                        image_depth_similarity = image_depth_similarity[gt_inds].to(dtype=mask_feats.dtype)
+                        depth_weights = (image_depth_similarity >= self.pairwise_depth_thresh).float()
+                        if self.depth_with_box:
+                            depth_weights = depth_weights * gt_bitmasks.float()
+                        loss_depth_pairwise = (pairwise_losses * depth_weights).sum() / depth_weights.sum().clamp(
+                            min=1.0)
+                        warmup_factor2 = min((self._iter.item() - 10000) / float(self._warmup_iters), 1.0)
+                        loss_depth_pairwise = loss_depth_pairwise * warmup_factor2 * self.hpyer_parameters[3]
+                        losses.update({
+                            'loss_depth_pairwise': loss_depth_pairwise,
+                        })
+
+                else:
+                    # fully-supervised CondInst losses
+                    mask_losses = dice_coefficient(mask_scores, gt_bitmasks)
+                    loss_mask = mask_losses.mean()
+                    losses["loss_mask"] = loss_mask
+
+            return losses
+        else:
+            if len(pred_instances) > 0:
+                mask_logits = self.mask_heads_forward_with_coords(
+                    mask_feats, mask_feat_stride, pred_instances
+                )
+                pred_instances.pred_global_masks = mask_logits.sigmoid()
+
+            return pred_instances
